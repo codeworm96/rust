@@ -7,18 +7,21 @@ use dep_graph::{DepGraph, DepNode, DepKind, DepNodeIndex};
 
 use hir::def_id::{CRATE_DEF_INDEX, DefId, LocalDefId, DefIndexAddressSpace};
 
-use middle::cstore::CrateStore;
+use middle::cstore::CrateStoreDyn;
 
 use rustc_target::spec::abi::Abi;
 use rustc_data_structures::svh::Svh;
+use rustc_data_structures::sync::join;
 use syntax::ast::{self, Name, NodeId, CRATE_NODE_ID};
 use syntax::source_map::Spanned;
 use syntax::ext::base::MacroKind;
 use syntax_pos::{Span, DUMMY_SP};
 
 use hir::*;
+use hir::itemlikevisit::ItemLikeVisitor;
 use hir::print::Nested;
 use util::nodemap::FxHashMap;
+use util::common::time;
 
 use std::io;
 use std::result::Result::Err;
@@ -504,6 +507,33 @@ impl<'hir> Map<'hir> {
 
         self.dep_graph.read(def_path_hash.to_dep_node(DepKind::Hir));
         &self.forest.krate.attrs
+    }
+
+    pub fn visit_module_item_likes<V>(&self, module: DefId, visitor: &mut V)
+        where V: ItemLikeVisitor<'hir>
+    {
+        let node_id = self.as_local_node_id(module).unwrap();
+
+        // We can't currently add a dependency on all the items in a module, just
+        // restrict use to ignored tasks for now
+        self.dep_graph.assert_ignored();
+
+        let module = &self.forest.krate.modules[&node_id];
+
+        for id in &module.items {
+            self.read(*id);
+            visitor.visit_item(&self.forest.krate.items[id]);
+        }
+
+        for id in &module.trait_items {
+            self.read(id.node_id);
+            visitor.visit_trait_item(&self.forest.krate.trait_items[id]);
+        }
+
+        for id in &module.impl_items {
+            self.read(id.node_id);
+            visitor.visit_impl_item(&self.forest.krate.impl_items[id]);
+        }
     }
 
     /// Retrieve the Node corresponding to `id`, panicking if it cannot
@@ -1017,26 +1047,30 @@ impl Named for TraitItem { fn name(&self) -> Name { self.ident.name } }
 impl Named for ImplItem { fn name(&self) -> Name { self.ident.name } }
 
 pub fn map_crate<'hir>(sess: &::session::Session,
-                       cstore: &dyn CrateStore,
-                       forest: &'hir mut Forest,
+                       cstore: &CrateStoreDyn,
+                       forest: &'hir Forest,
                        definitions: &'hir Definitions)
                        -> Map<'hir> {
-    let (map, crate_hash) = {
+    let ((map, crate_hash), hir_to_node_id) = join(|| {
         let hcx = ::ich::StableHashingContext::new(sess, &forest.krate, definitions, cstore);
 
-        let mut collector = NodeCollector::root(&forest.krate,
+        let mut collector = NodeCollector::root(sess,
+                                                &forest.krate,
                                                 &forest.dep_graph,
                                                 &definitions,
-                                                hcx,
-                                                sess.source_map());
+                                                hcx);
         intravisit::walk_crate(&mut collector, &forest.krate);
 
         let crate_disambiguator = sess.local_crate_disambiguator();
         let cmdline_args = sess.opts.dep_tracking_hash();
         collector.finalize_and_compute_crate_hash(crate_disambiguator,
-                                                  cstore,
-                                                  cmdline_args)
-    };
+                                                cstore,
+                                                cmdline_args)
+    }, || {
+        // Build the reverse mapping of `node_to_hir_id`.
+        definitions.node_to_hir_id.iter_enumerated()
+                    .map(|(node_id, &hir_id)| (hir_id, node_id)).collect()
+    });
 
     if log_enabled!(::log::Level::Debug) {
         // This only makes sense for ordered stores; note the
@@ -1050,10 +1084,6 @@ pub fn map_crate<'hir>(sess: &::session::Session,
               entries, vector_length, (entries as f64 / vector_length as f64) * 100.);
     }
 
-    // Build the reverse mapping of `node_to_hir_id`.
-    let hir_to_node_id = definitions.node_to_hir_id.iter_enumerated()
-        .map(|(node_id, &hir_id)| (hir_id, node_id)).collect();
-
     let map = Map {
         forest,
         dep_graph: forest.dep_graph.clone(),
@@ -1063,7 +1093,9 @@ pub fn map_crate<'hir>(sess: &::session::Session,
         definitions,
     };
 
-    hir_id_validator::check_crate(&map);
+    time(sess, "validate hir map", || {
+        hir_id_validator::check_crate(&map);
+    });
 
     map
 }

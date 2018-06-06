@@ -676,6 +676,13 @@ pub struct WhereEqPredicate {
     pub rhs_ty: P<Ty>,
 }
 
+#[derive(Clone, RustcEncodable, RustcDecodable, Debug)]
+pub struct ModuleItems {
+    pub items: Vec<NodeId>,
+    pub trait_items: Vec<TraitItemId>,
+    pub impl_items: Vec<ImplItemId>,
+}
+
 /// The top-level data structure that stores the entire contents of
 /// the crate currently being compiled.
 ///
@@ -708,6 +715,10 @@ pub struct Crate {
     /// in the crate, you should iterate over this list rather than the keys
     /// of bodies.
     pub body_ids: Vec<BodyId>,
+
+    /// A list of modules written out in the order in which they
+    /// appear in the crate. This includes the main crate module.
+    pub modules: BTreeMap<NodeId, ModuleItems>,
 }
 
 impl Crate {
