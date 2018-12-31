@@ -90,6 +90,8 @@ pub struct LoweringContext<'a> {
     trait_impls: BTreeMap<DefId, Vec<NodeId>>,
     trait_auto_impl: BTreeMap<DefId, NodeId>,
 
+    modules: BTreeMap<NodeId, hir::ModuleItems>,
+
     is_generator: bool,
 
     catch_scopes: Vec<NodeId>,
@@ -228,6 +230,7 @@ pub fn lower_crate(
         bodies: BTreeMap::new(),
         trait_impls: BTreeMap::new(),
         trait_auto_impl: BTreeMap::new(),
+        modules: BTreeMap::new(),
         exported_macros: Vec::new(),
         catch_scopes: Vec::new(),
         loop_scopes: Vec::new(),
@@ -356,6 +359,15 @@ impl<'a> LoweringContext<'a> {
         }
 
         impl<'lcx, 'interner> Visitor<'lcx> for MiscCollector<'lcx, 'interner> {
+            fn visit_mod(&mut self, m: &'lcx Mod, _s: Span, _attrs: &[Attribute], n: NodeId) {
+                self.lctx.modules.insert(n, hir::ModuleItems {
+                    items: Vec::new(),
+                    trait_items: Vec::new(),
+                    impl_items: Vec::new(),
+                });
+                visit::walk_mod(self, m);
+            }
+
             fn visit_item(&mut self, item: &'lcx Item) {
                 self.lctx.allocate_hir_id_counter(item.id, item);
 
@@ -395,6 +407,7 @@ impl<'a> LoweringContext<'a> {
 
         struct ItemLowerer<'lcx, 'interner: 'lcx> {
             lctx: &'lcx mut LoweringContext<'interner>,
+            module: NodeId,
         }
 
         impl<'lcx, 'interner> ItemLowerer<'lcx, 'interner> {
@@ -414,11 +427,20 @@ impl<'a> LoweringContext<'a> {
         }
 
         impl<'lcx, 'interner> Visitor<'lcx> for ItemLowerer<'lcx, 'interner> {
+            fn visit_mod(&mut self, m: &'lcx Mod, _s: Span, _attrs: &[Attribute], n: NodeId) {
+                let old = self.module;
+                self.module = n;
+                visit::walk_mod(self, m);
+                self.module = old;
+            }
+
             fn visit_item(&mut self, item: &'lcx Item) {
                 let mut item_lowered = true;
+                let module = &self.module;
                 self.lctx.with_hir_id_owner(item.id, |lctx| {
                     if let Some(hir_item) = lctx.lower_item(item) {
                         lctx.items.insert(item.id, hir_item);
+                        lctx.modules.get_mut(module).unwrap().items.push(item.id);
                     } else {
                         item_lowered = false;
                     }
@@ -433,8 +455,9 @@ impl<'a> LoweringContext<'a> {
                         _ => HirVec::new(),
                     };
 
+                    let module = self.module;
                     self.lctx.with_parent_impl_lifetime_defs(&item_generics, |this| {
-                        let this = &mut ItemLowerer { lctx: this };
+                        let this = &mut ItemLowerer { lctx: this, module };
                         if let ItemKind::Impl(.., ref opt_trait_ref, _, _) = item.node {
                             this.with_trait_impl_ref(opt_trait_ref, |this| {
                                 visit::walk_item(this, item)
@@ -447,20 +470,24 @@ impl<'a> LoweringContext<'a> {
             }
 
             fn visit_trait_item(&mut self, item: &'lcx TraitItem) {
+                let module = &self.module;
                 self.lctx.with_hir_id_owner(item.id, |lctx| {
                     let id = hir::TraitItemId { node_id: item.id };
                     let hir_item = lctx.lower_trait_item(item);
                     lctx.trait_items.insert(id, hir_item);
+                    lctx.modules.get_mut(module).unwrap().trait_items.push(id);
                 });
 
                 visit::walk_trait_item(self, item);
             }
 
             fn visit_impl_item(&mut self, item: &'lcx ImplItem) {
+                let module = &self.module;
                 self.lctx.with_hir_id_owner(item.id, |lctx| {
                     let id = hir::ImplItemId { node_id: item.id };
                     let hir_item = lctx.lower_impl_item(item);
                     lctx.impl_items.insert(id, hir_item);
+                    lctx.modules.get_mut(module).unwrap().impl_items.push(id);
                 });
                 visit::walk_impl_item(self, item);
             }
@@ -470,7 +497,7 @@ impl<'a> LoweringContext<'a> {
         debug_assert!(self.node_id_to_hir_id[CRATE_NODE_ID] == hir::CRATE_HIR_ID);
 
         visit::walk_crate(&mut MiscCollector { lctx: &mut self }, c);
-        visit::walk_crate(&mut ItemLowerer { lctx: &mut self }, c);
+        visit::walk_crate(&mut ItemLowerer { lctx: &mut self, module: CRATE_NODE_ID }, c);
 
         let module = self.lower_mod(&c.module);
         let attrs = self.lower_attrs(&c.attrs);
@@ -492,6 +519,7 @@ impl<'a> LoweringContext<'a> {
             body_ids,
             trait_impls: self.trait_impls,
             trait_auto_impl: self.trait_auto_impl,
+            modules: self.modules,
         }
     }
 
